@@ -2,7 +2,7 @@
 underwater/bad weather/low light enhancement resources
 
 # researchers
-Dengxin Dai (ETH): http://www.vision.ee.ethz.ch/~daid/
+Dengxin Dai (ETH): http://www.vision.ee.ethz.ch/~daid/ \\
 Bill Freeman (MIT) https://billf.mit.edu/publications/all
 Vishal M Patel (Johns Hopkins University): https://engineering.jhu.edu/vpatel36/sciencex_teams/vishalpatel/
 Srinivasa Narasimhan (CMU): http://www.cs.cmu.edu/~srinivas/
