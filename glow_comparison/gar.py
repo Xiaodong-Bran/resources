@@ -146,29 +146,56 @@ def fit_apsf_envelope(I, cores, core_mask, size=257, fit_scale=0.5,
                               options={"xatol": 1e-3})
         return float(res.x)
 
-    def cost(x):
-        sigma, p = np.exp(x[0]), x[1]
-        if not (0.2 <= p <= 1.3) or not (0.5 <= sigma <= 100):
-            return 1e9
-        B = render(Cs, sigma, p, fit_scale)
-        total = 0.0
-        for c in range(D):
-            a = amp_for(B[..., c], Is[..., c], w)
-            total += asym_cost(a * B[..., c] - Is[..., c], w)
-        return total
+    def fit_one(target, w, sig_lo, sig_hi, seeds, base=None):
+        """Fit one (sigma, p) + per-channel amps; `base` is an already
+        rendered component added to the model inside the envelope cost."""
+        base_s = 0.0 if base is None else base
 
-    best = None
-    for s0 in [2.0, 6.0, 15.0]:
-        for p0 in [0.5, 0.9]:
-            res = minimize(cost, [np.log(s0), p0], method="Nelder-Mead",
-                           options={"maxiter": 40, "xatol": 1e-2, "fatol": 1e-8})
-            if best is None or res.fun < best.fun:
-                best = res
-    sigma, p = np.exp(best.x[0]), best.x[1]
-    Bs = render(Cs, sigma, p, fit_scale)
-    a = np.array([amp_for(Bs[..., c], Is[..., c], w) for c in range(D)])
-    B_full = render(cores, sigma, p, 1.0)
-    return {"sigma": sigma, "p": p, "amps": a.tolist()}, a[None, None, :] * B_full
+        def cost(x):
+            sigma, p = np.exp(x[0]), x[1]
+            if not (0.2 <= p <= 1.3) or not (sig_lo <= sigma <= sig_hi):
+                return 1e9
+            B = render(Cs, sigma, p, fit_scale)
+            total = 0.0
+            for c in range(D):
+                bs = base_s if base is None else base_s[..., c]
+                a = amp_for(B[..., c], target[..., c] - bs, w)
+                total += asym_cost(bs + a * B[..., c] - target[..., c], w)
+            return total
+
+        best = None
+        for s0 in seeds:
+            for p0 in [0.5, 0.9]:
+                res = minimize(cost, [np.log(s0), p0], method="Nelder-Mead",
+                               options={"maxiter": 40, "xatol": 1e-2,
+                                        "fatol": 1e-8})
+                if best is None or res.fun < best.fun:
+                    best = res
+        sigma, p = np.exp(best.x[0]), best.x[1]
+        Bs = render(Cs, sigma, p, fit_scale)
+        a = []
+        for c in range(D):
+            bs = base_s if base is None else base_s[..., c]
+            a.append(amp_for(Bs[..., c], target[..., c] - bs, w))
+        a = np.array(a)
+        return sigma, p, a, a[None, None, :] * Bs
+
+    # two-scale APSF mixture: a real APSF has a sharp peak AND a heavy tail.
+    # A single kernel collapses to one or the other (a broad ambient fit
+    # erases the compact halo around point lights), so fit a narrow kernel
+    # on the near-halo first, then a broad kernel on what remains.
+    w_near = w * (dist <= 25 * fit_scale)
+    if w_near.sum() < 20:
+        w_near = w
+    s_n, p_n, a_n, Bn_s = fit_one(Is, w_near, 0.5, 12.0, [1.5, 4.0, 8.0])
+    s_b, p_b, a_b, _ = fit_one(Is, w, 8.0, 100.0, [15.0, 40.0], base=Bn_s)
+
+    B_full_n = render(cores, s_n, p_n, 1.0)
+    B_full_b = render(cores, s_b, p_b, 1.0)
+    G_fit = a_n[None, None, :] * B_full_n + a_b[None, None, :] * B_full_b
+    return {"sigma": s_n, "p": p_n, "amps": a_n.tolist(),
+            "sigma_broad": s_b, "p_broad": p_b,
+            "amps_broad": a_b.tolist()}, G_fit
 
 
 def gar_glow(I, ambient_sigma=25.0, li_kwargs=None):
