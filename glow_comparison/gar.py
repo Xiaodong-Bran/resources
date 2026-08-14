@@ -36,8 +36,11 @@ def _apsf_kernel(size, sigma, p):
     return k / s if s > 0 else k
 
 
-def detect_cores(I, thresh=0.98, min_pix=1):
-    """Saturated light-source cores; returns HxWx3 core map (colored)."""
+def detect_cores(I, thresh=0.9, min_pix=1):
+    """Bright light-source cores (max-channel >= thresh); returns HxWx3
+    colored core map and binary mask. The threshold is deliberately below
+    full saturation so strongly colored sources (e.g. a bright blue sign,
+    whose max channel peaks near but under 1.0) still count as sources."""
     gray = I.max(axis=2)
     mask = (gray >= thresh).astype(np.float64)
     if mask.sum() < min_pix:
@@ -188,16 +191,18 @@ def gar_glow(I, ambient_sigma=25.0, li_kwargs=None):
     # physical bound: the observed intensity is an upper envelope of the glow.
     # Use a morphological closing of I as the bound so fine dark scene texture
     # is not imprinted (inverted) into the glow map.
-    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
     upper = np.stack([cv2.morphologyEx(I[..., c], cv2.MORPH_CLOSE, kern)
                       for c in range(3)], axis=-1)
-    upper = np.stack([gaussian_filter(upper[..., c], 2.0) for c in range(3)],
+    upper = np.stack([gaussian_filter(upper[..., c], 4.0) for c in range(3)],
                      axis=-1)
-    # soft compression toward the envelope: G' = U(1 - exp(-G/U)) stays below
-    # U but approaches it smoothly, so no hard clamped plateaus imprint scene
-    # texture edges into the glow map
+    # smooth-min toward the envelope: G' = G / (1+(G/U)^k)^(1/k) leaves
+    # values below the bound nearly untouched (unlike exponential
+    # compression, which attenuates them too) while still approaching U
+    # smoothly, so no hard clamped plateaus imprint scene texture edges
     U = np.maximum(upper, 1e-3)
-    G = U * (1.0 - np.exp(-G / U))
+    k = 4.0
+    G = G / (1.0 + (G / U) ** k) ** (1.0 / k)
     J = np.clip(I - G, 0, 1)
     params["core_pixels"] = int(mask.sum())
     return J, G, params
