@@ -45,7 +45,26 @@ def detect_cores(I, thresh=0.9, min_pix=1):
     mask = (gray >= thresh).astype(np.float64)
     if mask.sum() < min_pix:
         mask = (gray >= np.quantile(gray, 0.999)).astype(np.float64)
-    return I * mask[..., None], mask
+    cores = I * mask[..., None]
+
+    # sensor clipping desaturates saturated cores toward white (a red lamp's
+    # core reads ~(0.96,0.49,0.38)), which would render a grey halo. The
+    # source's true chromaticity survives in the unsaturated halo ring right
+    # outside the core, so recolor each core from its ring's median color.
+    n_lbl, lbl = cv2.connectedComponents(mask.astype(np.uint8))
+    for i in range(1, n_lbl):
+        comp = lbl == i
+        dist = cv2.distanceTransform((~comp).astype(np.uint8), cv2.DIST_L2, 3)
+        ring = (dist > 1) & (dist <= 8) & (~mask.astype(bool))
+        if ring.sum() < 8:
+            continue
+        c = np.median(I[ring], axis=0)
+        if c.max() < 0.05:
+            continue
+        c = c / c.max()
+        inten = gray[comp]
+        cores[comp] = inten[:, None] * c[None, :]
+    return cores, mask
 
 
 def fit_apsf(G_li, cores, size=129, fit_scale=0.5):
