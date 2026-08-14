@@ -136,6 +136,9 @@ a { color:var(--cyan); }
 <li><b>glow 图做引导图、强不规则 glow 研究</b> —— <b>ONVE</b>：结构分离最纯净，但幅值低估、慢三个数量级。</li>
 </ul>
 
+<h2>继续检索（阴性结果）</h2>
+<p>按要求追加的一轮搜索与实验：<b>深度学习线</b>——系统性尝试了全部可达的权重获取渠道（官方源、HuggingFace、Dropbox/网盘、仓库内文件、README 的 release 链接、release 页面枚举），除已用于 ONVE 的 VGG16-bn 外无一可达，ACMMM 2023 / ICCV 2021 无法实测；<b>经典改进线</b>（<code>li_variants.py</code>）——两个无检测环节的候选均落败：Li + WLS 边缘感知精修（TIP 2020 后处理的彩色适配）合成集 21.69 且真实图泄漏反而升高（WLS 的边缘保持把场景边缘保进了 glow 图），多尺度 Li 融合 21.25（max 融合系统性高估）。阴性结果强化了核心结论：<b>Li 2015 在无检测环节的经典方法中处于局部最优</b>，鲁棒地超过它大概率需要学习到的先验。</p>
+
 <div class="note"><b>实验限制</b>：ONVE 在 CPU 上以官方默认超参运行，未做每图调参；合成基准与 GAR 共享"平移不变 APSF 卷积"生成假设（对 GAR 有利），
 真实场景优势以无参考指标与目视为准；ACMMM 2023 / ICCV 2021 深度模型因权重不可达未能实测。
 完整代码与数据见仓库分支 <code>claude/glow-removal-algorithm-comparison-90t5bs</code> 的 <code>glow_comparison/</code>（<code>gar.py</code> 为改进算法）。</div>
