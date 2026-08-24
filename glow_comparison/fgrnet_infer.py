@@ -24,25 +24,18 @@ import torch
 from PIL import Image
 
 
-def load_arch(repo, act="relu", order="sf"):
-    """Import FGRNet_arch.py standalone (stubbing basicsr.utils.registry) and
-    patch New_TransformerBlock to match the released checkpoint.
+def load_arch(repo):
+    """Import FGRNet_arch.py standalone, stubbing basicsr.utils.registry.
 
-    The released code and checkpoint diverge: the checkpoint names the SFEM
-    'sfb' and adds a channel-attention branch 'cab' fused with the declared
-    (but unused) `self.fusion` conv. CAB's structure is reconstructed from
-    the checkpoint tensor shapes:
-        cab.cab = Sequential(Conv(d,d//3,3), BN(d//3), <act>, Conv(d//3,d,3),
-                             CA(d))     with CA: x * Sigmoid(Conv(1,d,1)(
-                             ReLU(Conv(d,1,1)(AvgPool(x)))))
-    The paramless activation and the concat order in fusion are ambiguous;
-    `act` in {relu,gelu} and `order` in {sf,fs} select a variant, to be
-    validated empirically against the official GT test data.
+    The released checkpoint carries two extra module groups per block, `cab`
+    and `fusion`, plus the SFEM stored under the name `sfb`. Statistical
+    inspection shows cab and fusion are DEAD parameters: fusion's weights sit
+    exactly at their kaiming-uniform init bounds and cab's BatchNorm has
+    running_mean=0, running_var=1, num_batches_tracked=0 — they never
+    received a forward pass during training. The trained computation is
+    therefore exactly the released forward; loading only requires renaming
+    sfb->sfem and dropping the dead cab keys (see remap_state_dict).
     """
-    import math
-    import torch.nn as nn
-    from einops import rearrange
-
     pkg = types.ModuleType("basicsr")
     utils = types.ModuleType("basicsr.utils")
     registry = types.ModuleType("basicsr.utils.registry")
@@ -64,98 +57,18 @@ def load_arch(repo, act="relu", order="sf"):
     spec = importlib.util.spec_from_file_location("fgrnet_arch", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-
-    class ChanAtt(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            mid = max(1, dim // 30)
-            self.attention = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(dim, mid, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(mid, dim, 1),
-                nn.Sigmoid())
-
-        def forward(self, x):
-            return x * self.attention(x)
-
-    class CAB(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            a = nn.ReLU(inplace=True) if act == "relu" else nn.GELU()
-            self.cab = nn.Sequential(
-                nn.Conv2d(dim, dim // 3, 3, 1, 1),
-                nn.BatchNorm2d(dim // 3),
-                a,
-                nn.Conv2d(dim // 3, dim, 3, 1, 1),
-                ChanAtt(dim))
-
-        def forward(self, x):
-            return self.cab(x)
-
-    Blk = mod.New_TransformerBlock
-    orig_init = Blk.__init__
-
-    def new_init(self, dim, *a, **k):
-        orig_init(self, dim, *a, **k)
-        self.sfb = self._modules.pop("sfem")
-        self.cab = CAB(dim)
-
-    def new_forward(self, x, mask=None):
-        B, L, C = x.shape
-        H = W = int(math.sqrt(L))
-        if mask is not None:
-            import torch.nn.functional as F
-            input_mask = F.interpolate(mask, size=(H, W)).permute(0, 2, 3, 1)
-            imw = mod.window_partition(input_mask, self.win_size)
-            attn_mask = imw.view(-1, self.win_size * self.win_size)
-            attn_mask = attn_mask.unsqueeze(2) * attn_mask.unsqueeze(1)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)
-                                              ).masked_fill(attn_mask == 0, 0.0)
-        else:
-            attn_mask = None
-        if self.shift_size > 0:
-            shift_mask = torch.zeros((1, H, W, 1)).type_as(x)
-            slices = (slice(0, -self.win_size),
-                      slice(-self.win_size, -self.shift_size),
-                      slice(-self.shift_size, None))
-            cnt = 0
-            for h in slices:
-                for w in slices:
-                    shift_mask[:, h, w, :] = cnt
-                    cnt += 1
-            smw = mod.window_partition(shift_mask, self.win_size)
-            smw = smw.view(-1, self.win_size * self.win_size)
-            sam = smw.unsqueeze(1) - smw.unsqueeze(2)
-            sam = sam.masked_fill(sam != 0, float(-100.0)).masked_fill(sam == 0, 0.0)
-            attn_mask = attn_mask + sam if attn_mask is not None else sam
-
-        shortcut = x
-        x = self.norm1(x).view(B, H, W, C).permute(0, 3, 1, 2)
-        shifted_x = torch.roll(x, (-self.shift_size, -self.shift_size), (1, 2)) \
-            if self.shift_size > 0 else x
-        xw = mod.window_partition(shifted_x, self.win_size)
-        xw = xw.view(-1, self.win_size * self.win_size, C)
-        aw = self.attn(xw, mask=attn_mask)
-        aw = aw.view(-1, self.win_size, self.win_size, C)
-        shifted_x = mod.window_reverse(aw, self.win_size, H, W)
-        x1 = torch.roll(shifted_x, (self.shift_size, self.shift_size), (1, 2)) \
-            if self.shift_size > 0 else shifted_x
-        x1 = x1.view(B, H * W, C)
-        x = shortcut + self.drop_path(x1)
-
-        a1 = self.mlp(self.norm2(x))
-        a1 = rearrange(a1, ' b (h w) c -> b c h w ', h=H, w=W)
-        s = self.sfb(a1)
-        c = self.cab(a1)
-        pair = [s, c] if order == "sf" else [c, s]
-        out = self.fusion(torch.cat(pair, dim=1))
-        out = rearrange(out, ' b c h w -> b (h w) c')
-        return x + self.drop_path(out)
-
-    Blk.__init__ = new_init
-    Blk.forward = new_forward
     return mod.Uformer
+
+
+def remap_state_dict(sd):
+    """sfb -> sfem; drop dead cab.* keys (fusion is declared in the released
+    arch, so its — untrained — keys load as-is and stay unused)."""
+    out = {}
+    for k, v in sd.items():
+        if ".cab." in k:
+            continue
+        out[k.replace(".sfb.", ".sfem.")] = v
+    return out
 
 
 def adjust_gamma(t, gamma):
@@ -171,18 +84,16 @@ def main():
         "PBFG_CKPT", "pbfg_ckpt/checkpoint/net_g_last.pth"))
     ap.add_argument("--gt", default=None)
     ap.add_argument("--size", type=int, default=512)
-    ap.add_argument("--act", default="relu", choices=["relu", "gelu"])
-    ap.add_argument("--order", default="sf", choices=["sf", "fs"])
     args = ap.parse_args()
 
-    Uformer = load_arch(args.repo, act=args.act, order=args.order)
+    Uformer = load_arch(args.repo)
     model = Uformer(img_size=args.size, img_ch=3, output_ch=6)
     sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     if "params_ema" in sd:
         sd = sd["params_ema"]
     elif "params" in sd:
         sd = sd["params"]
-    model.load_state_dict(sd)
+    model.load_state_dict(remap_state_dict(sd), strict=True)
     model.eval()
     print("checkpoint loaded")
 
